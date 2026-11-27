@@ -1,0 +1,21 @@
+[buttons]
+Y = "shift_up"
+B = "shift_down"
+A = "select"
+Z = "shift_both"
+SHIFT = "shift_up"
+
+[left_buttons]
+UP = "shift_up"
+DOWN = "shift_down"
+LEFT = "nav_left"
+RIGHT = "nav_right"
+SHIFT = "shift_both"
+
+[paddle]
+axis = "lr"
+invert = false
+deadzone = 8
+full_scale = 100
+left = "steer_left"
+right = "steer_right"
