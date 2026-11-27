@@ -11,6 +11,7 @@ from time import monotonic
 from uuid import UUID
 
 
+logger = logging.getLogger("zwift_play_bridge.dircon")
 HEADER = Struct("!BBBBH")
 DISCOVER, CHARACTERISTICS, READ, WRITE, SUBSCRIBE, NOTIFY = range(1, 7)
 READABLE, WRITABLE, NOTIFIABLE, INDICATABLE = 1, 2, 4, 8
@@ -138,6 +139,9 @@ class Session:
             self.writer.close()
         if not self.writer.is_closing():
             self.writer.write(HEADER.pack(1, operation, sequence, status, len(payload)) + payload)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Bridge -> Zwift [%x] op=0x%02x seq=%d status=%d len=%d payload=%s",
+                             id(self), operation, sequence, status, len(payload), payload[:96].hex(" "))
 
     def reply(self, characteristic, data):
         if characteristic in self.subscribed:
@@ -157,6 +161,8 @@ class Session:
                 return
             if object_id in self.get_values:
                 self.reply(TX, b"\x3c\x08" + varint(object_id) + blob(0x12, self.get_values[object_id]))
+            else:
+                logger.debug("Zwift GET [%x] object=%s has no bridge reply", id(self), object_id)
 
     def request(self, op, sequence, payload):
         uuid, data = payload[:16], payload[16:]
@@ -251,19 +257,25 @@ class Controller:
                 header = await reader.readexactly(HEADER.size)
                 version, op, sequence, code, length = HEADER.unpack(header)
                 payload = await reader.readexactly(length)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("Zwift -> Bridge [%x] version=%d op=0x%02x seq=%d status=%d "
+                                 "uuid=%s len=%d data=%s",
+                                 id(session), version, op, sequence, code, payload[:16].hex(), length,
+                                 payload[16:112].hex(" "))
                 if version != 1:
                     session.send(op, sequence, status=7)
                 elif code == 0:
                     ready = session.ready
                     session.request(op, sequence, payload)
                     if session.ready and not ready:
-                        logging.info("Zwift connected")
+                        logger.info("Zwift connected")
                         session.send_state(self.state)
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
             self.sessions.discard(session)
+            logger.debug("Zwift Direct Connect session [%x] closed", id(session))
             writer.close()
             try:
                 await writer.wait_closed()

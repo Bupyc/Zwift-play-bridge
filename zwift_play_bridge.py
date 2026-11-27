@@ -15,6 +15,7 @@ from bleak.exc import BleakError
 import zwift_dircon as dircon
 
 
+logger = logging.getLogger("zwift_play_bridge")
 SIDES = {0x02: "right", 0x03: "left", 0x0E: "right", 0x0F: "left"}
 # Legacy ZwiftPlayNotification assigns btnSide to field 6 and btnFront to field 7.
 LEGACY_BUTTONS = {
@@ -37,6 +38,8 @@ ACTIONS = DIGITAL.keys() | ANALOG | {"ignore"}
 DEFAULT_CONFIG = Path(__file__).with_name("zwift-play-bridge.toml")
 RIDE_ON = b"RideOn"
 FIRMWARE_REVISION = "00002a26-0000-1000-8000-00805f9b34fb"
+SHIFT_MASK = LS1 | RS1 | DIGITAL["shift_down_2"] | DIGITAL["shift_up_2"]
+LOCAL_HAPTIC_PULSE = bytes.fromhex("12 12 08 0a 06 08 02 10 00 18 20")
 
 
 @dataclass(frozen=True)
@@ -107,8 +110,10 @@ def decode_input(data, side):
 
 def map_input(data, config, side="right"):
     inputs = decode_input(data, side)
-    if inputs is None:
-        return None
+    return None if inputs is None else map_controls(inputs, config, side)
+
+
+def map_controls(inputs, config, side):
     pressed, horizontal, vertical = inputs
     if config is None:
         mask = sum(KEYPAD_BUTTONS[side][name] for name in pressed)
@@ -166,11 +171,16 @@ def select_controller(devices, selector, expected_side=None):
 
 
 class PlayInputs:
-    def __init__(self, endpoint):
+    def __init__(self, endpoint, local_haptics=False):
         self.endpoint = endpoint
         self.states = {"left": dircon.IDLE, "right": dircon.IDLE}
+        self.clients = {}
+        self.local_haptics = local_haptics
+        self.local_effects = {}
+        self.braking = set()
 
     def update(self, side, state):
+        previous = self.states[side]
         self.states[side] = state
         left, right = self.states["left"], self.states["right"]
         self.endpoint.update((
@@ -178,6 +188,48 @@ class PlayInputs:
             max(left[1], right[1], key=abs),
             max(right[2], left[2], key=abs),
         ))
+        if self.local_haptics and side in self.clients:
+            new_buttons = state[0] & ~previous[0]
+            brake = max(state[1], -state[2])
+            start_brake = brake >= 20 and side not in self.braking
+            if start_brake:
+                self.braking.add(side)
+            elif brake <= 10:
+                self.braking.discard(side)
+            if new_buttons & DIGITAL["ride_on"]:
+                self.start_local_haptic(side, "ride_on")
+            elif new_buttons & SHIFT_MASK:
+                self.start_local_haptic(side, "shift")
+            elif start_brake:
+                self.start_local_haptic(side, "brake")
+
+    def start_local_haptic(self, side, effect):
+        if not self.local_haptics:
+            return
+        previous = self.local_effects.get(side)
+        if previous is not None:
+            previous.cancel()
+        self.local_effects[side] = asyncio.create_task(self.play_local_haptic(side, effect))
+
+    async def play_local_haptic(self, side, effect):
+        client = self.clients[side]
+        if effect == "ride_on":
+            await asyncio.sleep(0.55)
+        for pulse in range({"shift": 1, "brake": 2, "connect": 3, "ride_on": 3}[effect]):
+            if pulse:
+                await asyncio.sleep(0.15)
+            if self.clients.get(side) is not client:
+                return
+            if effect == "ride_on" and not self.states[side][0] & DIGITAL["ride_on"]:
+                return
+            try:
+                logger.debug("Bridge -> Play %s GATT RX write without response: %s",
+                             side, LOCAL_HAPTIC_PULSE.hex(" "))
+                async with asyncio.timeout(1):
+                    await client.write_gatt_char(dircon.RX.hex(), LOCAL_HAPTIC_PULSE, response=False)
+            except (BleakError, OSError, TimeoutError) as error:
+                logger.warning("Play %s vibration write failed: %s", side, error)
+                return
 
 
 async def send_ride_on(client, selector):
@@ -185,13 +237,13 @@ async def send_ride_on(client, selector):
         value = await asyncio.wait_for(client.read_gatt_char(FIRMWARE_REVISION), timeout=3)
         firmware = value.decode("ascii", errors="replace").strip("\0 \r\n\t")
     except (BleakError, OSError, TimeoutError) as error:
-        logging.debug("Firmware revision unavailable for %s (%s)", selector, error)
+        logger.debug("Firmware revision unavailable for %s (%s)", selector, error)
         firmware = ""
     major = firmware.lstrip("vV").split(".", 1)[0]
     versioned = major.isdecimal() and int(major) >= 2
     message = RIDE_ON + b"\x02\x03" if versioned else RIDE_ON
-    logging.info("Play %s firmware %s, sending %s", selector, firmware or "unknown",
-                 "RideOn 02 03" if versioned else "RideOn")
+    logger.info("Play %s firmware %s, sending %s", selector, firmware or "unknown",
+                "RideOn 02 03" if versioned else "RideOn")
     await client.write_gatt_char(dircon.RX.hex(), message, response=False)
 
 
@@ -202,30 +254,35 @@ async def watch_play(selector, expected_side, config, inputs, monitor, bluetooth
             ready, disconnected = asyncio.Event(), asyncio.Event()
             last = None
 
-            def receive(_, payload):
+            def receive(characteristic, payload):
                 nonlocal last
                 data = bytes(payload)
                 if data.startswith(RIDE_ON):
                     ready.set()
                 try:
-                    state = map_input(data, config, side)
+                    controls = decode_input(data, side)
                 except ValueError:
-                    logging.debug("Ignoring malformed Play input: %s", data.hex(" "))
+                    logger.debug("Ignoring malformed Play input: %s", data[:96].hex(" "))
                     return
-                if state is None:
+                if logger.isEnabledFor(logging.DEBUG) and (controls is None or data != last):
+                    logger.debug("Play %s %s -> Bridge GATT notify uuid=%s len=%d data=%s",
+                                 side, selector, characteristic.uuid, len(data), data[:96].hex(" "))
+                if controls is None:
                     return
                 ready.set()
+                pressed, horizontal, vertical = controls
+                state = map_controls(controls, config, side)
                 inputs.update(side, state)
-                if monitor and data != last:
+                if data != last:
                     last = data
-                    pressed, horizontal, vertical = decode_input(data, side)
-                    logging.info("%s %s buttons=%s LR=%d UD=%d → mask=0x%04x ZL=%d ZR=%d", side, selector,
-                                 ",".join(sorted(pressed)) or "-", horizontal, vertical, *state)
+                    if monitor:
+                        logger.info("%s %s buttons=%s LR=%d UD=%d → mask=0x%04x ZL=%d ZR=%d", side, selector,
+                                    ",".join(sorted(pressed)) or "-", horizontal, vertical, *state)
 
             async with AsyncExitStack() as connection:
                 # Serialize discovery and the initial GATT setup. Active links keep running.
                 async with bluetooth_lock:
-                    logging.info("Looking for %s. Wake your controller with a button press.", selector)
+                    logger.info("Looking for %s. Wake your controller with a button press.", selector)
                     selected = select_controller(await scan_controllers(), selector, expected_side)
                     if selected is None:
                         continue
@@ -238,18 +295,27 @@ async def watch_play(selector, expected_side, config, inputs, monitor, bluetooth
                         await client.start_notify(characteristic.hex(), receive)
                     await send_ride_on(client, selector)
                     await asyncio.wait_for(ready.wait(), 5)
-                    logging.info("%s Play %s connected", side.capitalize(), selector)
+                    inputs.clients[side] = client
+                    logger.info("%s Play %s connected", side.capitalize(), selector)
+                    inputs.start_local_haptic(side, "connect")
                 await disconnected.wait()
+                logger.info("%s Play %s disconnected", side.capitalize(), selector)
         except (BleakError, OSError, TimeoutError) as error:
-            logging.warning("Play %s: %s", selector, error)
+            logger.warning("Play %s: %s", selector, error)
         finally:
             if side is not None:
+                inputs.clients.pop(side, None)
+                inputs.braking.discard(side)
+                effect = inputs.local_effects.pop(side, None)
+                if effect is not None:
+                    effect.cancel()
+                    await asyncio.gather(effect, return_exceptions=True)
                 inputs.update(side, dircon.IDLE)
         await asyncio.sleep(1)
 
 
-async def watch_inputs(targets, config, endpoint, monitor):
-    inputs = PlayInputs(endpoint)
+async def watch_inputs(targets, config, endpoint, monitor, local_haptics):
+    inputs = PlayInputs(endpoint, local_haptics)
     bluetooth_lock = asyncio.Lock()
     tasks = [
         asyncio.create_task(watch_play(selector, side, config, inputs, monitor, bluetooth_lock))
@@ -263,20 +329,20 @@ async def watch_inputs(targets, config, endpoint, monitor):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def run(targets, config, name, port, monitor):
+async def run(targets, config, name, port, monitor, local_haptics=False):
     endpoint = dircon.Controller(name)
     if monitor:
-        await watch_inputs(targets, config, endpoint, True)
+        await watch_inputs(targets, config, endpoint, True, local_haptics)
         return
     async with await asyncio.start_server(endpoint.connect, "0.0.0.0", port):
         registration = await asyncio.create_subprocess_exec(
             "/usr/bin/dns-sd", "-R", endpoint.name, dircon.SERVICE_TYPE, "local.", str(port),
             *endpoint.txt,
         )
-        logging.info("Select %s in Zwift Power Source, then Controls. Restore your trainer as Power Source.",
-                     endpoint.name)
+        logger.info("Select %s in Zwift Power Source, then Controls. Restore your trainer as Power Source.",
+                    endpoint.name)
         tasks = [
-            asyncio.create_task(watch_inputs(targets, config, endpoint, False)),
+            asyncio.create_task(watch_inputs(targets, config, endpoint, False, local_haptics)),
             asyncio.create_task(endpoint.heartbeat()),
             asyncio.create_task(registration.wait()),
         ]
@@ -312,6 +378,9 @@ def main():
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--port", type=int, default=36866, help="Direct Connect TCP port")
     parser.add_argument("--monitor", action="store_true", help="Show physical inputs without advertising to Zwift")
+    parser.add_argument("--local-haptics", action="store_true", help="Generate vibration from local controller input")
+    parser.add_argument("--debug", action="store_true", help="Show protocol traffic in the terminal")
+    parser.add_argument("--log-file", type=Path, help="Append a detailed protocol log to this file")
     args = parser.parse_args()
     if args.both:
         if not (args.left and args.left.strip() and args.right and args.right.strip()):
@@ -332,8 +401,19 @@ def main():
         parser.error("--name must contain 1 to 63 bytes")
     if args.device is not None and not args.device.strip():
         parser.error("--device must not be empty")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     try:
+        console = logging.StreamHandler()
+        console.setLevel(logging.DEBUG if args.debug else logging.INFO)
+        handlers = [console]
+        log_path = args.log_file.expanduser().resolve() if args.log_file is not None else None
+        if log_path is not None:
+            handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+        logging.basicConfig(level=logging.INFO, handlers=handlers, datefmt="%Y-%m-%d %H:%M:%S",
+                            format="%(asctime)s.%(msecs)03d %(levelname)s %(message)s")
+        if args.debug or log_path is not None:
+            logger.setLevel(logging.DEBUG)
+        if log_path is not None:
+            logger.info("Protocol log: %s", log_path)
         if args.scan:
             devices = asyncio.run(scan_controllers())
             for _, bluetooth_name, suffix, side in devices:
@@ -343,7 +423,7 @@ def main():
         else:
             targets = {"left": args.left, "right": args.right} if args.both else {None: args.device}
             config = None if args.passthrough else load_config(args.config)
-            asyncio.run(run(targets, config, name, args.port, args.monitor))
+            asyncio.run(run(targets, config, name, args.port, args.monitor, args.local_haptics))
     except (BleakError, OSError, RuntimeError, ValueError) as error:
         parser.exit(1, f"{error}\n")
     except KeyboardInterrupt:

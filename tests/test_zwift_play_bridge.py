@@ -137,7 +137,65 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(endpoint.state, dircon.IDLE)
 
 
+class LocalHapticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_button_paddle_and_hold_vibrate_only_on_the_source_side(self):
+        inputs = bridge.PlayInputs(dircon.Controller(), local_haptics=True)
+        left, right = (AsyncMock(spec=bridge.BleakClient) for _ in range(2))
+        inputs.clients.update(left=left, right=right)
+        pulse = bytes.fromhex("12 12 08 0a 06 08 02 10 00 18 20")
+
+        inputs.update("right", (bridge.RS1, 0, 0))
+        inputs.update("right", (bridge.RS1, 0, 0))
+        await inputs.local_effects["right"]
+        right.write_gatt_char.assert_awaited_once_with(dircon.RX.hex(), pulse, response=False)
+        left.write_gatt_char.assert_not_awaited()
+
+        inputs.update("left", (0, -50, 0))  # Steering never triggers the brake effect.
+        self.assertNotIn("left", inputs.local_effects)
+        inputs.update("left", (0, 25, 0))
+        inputs.update("left", (0, 75, 0))
+        await inputs.local_effects["left"]
+        self.assertEqual(left.write_gatt_char.await_count, 2)
+
+        inputs.update("right", (bridge.DIGITAL["ride_on"], 0, 0))
+        inputs.update("right", dircon.IDLE)
+        await inputs.local_effects["right"]
+        self.assertEqual(right.write_gatt_char.await_count, 1)
+        inputs.update("right", (bridge.DIGITAL["ride_on"], 0, 0))
+        await inputs.local_effects["right"]
+        self.assertEqual(right.write_gatt_char.await_count, 4)
+
+        inputs.start_local_haptic("left", "connect")
+        await inputs.local_effects["left"]
+        self.assertEqual(left.write_gatt_char.await_count, 5)
+
+
 class DirectConnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_zwift_vibration_is_logged_without_a_bluetooth_write(self):
+        trace = self.enterContext(self.assertLogs("zwift_play_bridge", level="DEBUG"))
+        endpoint = dircon.Controller()
+        inputs = bridge.PlayInputs(endpoint, local_haptics=True)
+        client = AsyncMock(spec=bridge.BleakClient)
+        inputs.clients["right"] = client
+        vibration = bytes.fromhex("12 12 08 0a 06 08 01 10 00 18 20")
+
+        async with await asyncio.start_server(endpoint.connect, "127.0.0.1", 0) as server:
+            reader, writer = await asyncio.open_connection(*server.sockets[0].getsockname())
+            try:
+                for seq, data in enumerate((b"RideOn\x02\x04", vibration, b"\x00\x08\x00"), 1):
+                    payload = dircon.RX + data
+                    writer.write(dircon.HEADER.pack(1, dircon.WRITE, seq, 0, len(payload)) + payload)
+                    async with asyncio.timeout(1):
+                        header = await reader.readexactly(dircon.HEADER.size)
+                        self.assertEqual(dircon.HEADER.unpack(header), (1, dircon.WRITE, seq, 0, 16))
+                        self.assertEqual(await reader.readexactly(16), dircon.RX)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        client.write_gatt_char.assert_not_awaited()
+        self.assertTrue(any("Zwift -> Bridge" in line and vibration.hex(" ") in line for line in trace.output))
+
     async def test_discovery_handshake_and_remapped_input_over_tcp(self):
         endpoint = dircon.Controller()
         async with await asyncio.start_server(endpoint.connect, "127.0.0.1", 0) as server:

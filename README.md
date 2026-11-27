@@ -49,6 +49,12 @@ Omit `--passthrough` to use the TOML bindings for both controllers. Add `--monit
 
 The temporary Power Source connection starts the handshake that makes the bridge available in Controls. Repeat the sequence after restarting Zwift if the bridge is missing from Controls. [Direct Connect pairing notes](https://github.com/VoltageSolutions/GameControllerForZwift/blob/v0.5.0/docs/use/pair-with-zwift.md)
 
+### Vibration
+
+Add `--local-haptics` to generate vibration from the bridge. The physical controller gives one pulse on a new shift input, two at the start of braking, and three when its Bluetooth connection is ready. Hold a button mapped to `ride_on` (right `Z` with `--passthrough`) for about half a second for up to three pulses. The bridge reacts to the mapped input, so it can also vibrate when a shift is requested at the gear limit.
+
+To diagnose missing vibration, add `--log-file "$HOME/Desktop/zwift-play-bridge.log"` to your usual bridge command before pairing in Zwift. The bridge prints the absolute path and appends a timestamped trace of Direct Connect messages, Bluetooth notifications, and attempted vibration writes. Add `--debug` to see the same trace in the terminal. Reproduce the issue in Zwift, then stop the bridge with <kbd>Ctrl</kbd>+<kbd>C</kbd>. A Bluetooth write without response can complete before the controller has acted on it.
+
 ## Default mapping
 
 | Action | Right Play | Left Play |
