@@ -1,13 +1,13 @@
 # Zwift Play Bridge
 
-Use a single left- or right-hand Zwift Play to steer both ways and shift gears in Zwift. The bridge reads the controller over Bluetooth and presents a virtual Zwift Ride controller over Wahoo Direct Connect on your local network. A TOML file controls how each button and paddle direction is mapped.
+Use one or both Zwift Play controllers to steer and shift gears in Zwift. The bridge reads the physical controllers over Bluetooth and presents a single virtual Zwift Ride over Wahoo Direct Connect on your local network. You can use the factory bindings for both controllers or set your own in a TOML file.
 
 > **Independent compatibility utility.** This project helps riders regain controls when they can only use one half of their Zwift Play pair. Zwift is a trademark of Zwift, Inc. The names identify compatible hardware and software. [Zwift Terms of Service](https://support.zwift.com/terms-of-service-HJt7VBYyH)
 
 ## Requirements
 
 - macOS with Bluetooth and Bonjour, and [Python 3.11 or newer](https://www.python.org/downloads/macos/). Developed with Python 3.13.
-- One Zwift Play controller. Input decoding was checked against a right controller on firmware 1.3.1 and a left controller on firmware 2.0.1.
+- One or two Zwift Play controllers. Input decoding was checked against a right controller on firmware 1.3.1 and a left controller on firmware 2.0.1.
 - For virtual shifting, a trainer that [supports Zwift virtual shifting](https://support.zwift.com/zwift-ready-and-zwift-cog-compatible-trainers-r1x1sNas0), such as the Wahoo KICKR v6.
 
 ## Set up on macOS
@@ -28,6 +28,18 @@ Allow Bluetooth access if macOS prompts you. The scan shows each supported contr
 ```
 
 Use the suffix if two controllers show the same name. Add `--name "My Play Bridge"` to change the name Zwift displays. Keep the bridge running while you ride.
+
+### Use both controllers
+
+Wake both controllers and use `--scan` to find their suffixes. This example uses the factory bindings.
+
+```sh
+.venv/bin/python zwift_play_bridge.py --both --left 12AB --right 34CD --passthrough
+```
+
+The left D-pad navigates, the right `A/B/Y/Z` buttons perform their usual actions, and the left and right side buttons shift down and up respectively. Each paddle steers outward and brakes inward. The bridge keeps both button states so you can press both shifters together in SRAM-Style. [Zwift Play controls](https://support.zwift.com/de/using-your-zwift-play-rkO3EZB3)
+
+Omit `--passthrough` to use the TOML bindings for both controllers. Add `--monitor` to see each controller's input in the terminal.
 
 ### Pair in Zwift
 

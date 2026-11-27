@@ -1,7 +1,8 @@
-"""Remap one Zwift Play controller to Zwift Ride controls on macOS."""
+"""Bridge one or two Zwift Play controllers to Zwift Ride controls on macOS."""
 
 import argparse
 import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -15,9 +16,10 @@ import zwift_dircon as dircon
 
 
 SIDES = {0x02: "right", 0x03: "left", 0x0E: "right", 0x0F: "left"}
+# Legacy ZwiftPlayNotification assigns btnSide to field 6 and btnFront to field 7.
 LEGACY_BUTTONS = {
-    "right": {"Y": 2, "Z": 3, "A": 4, "B": 5, "FRONT": 6, "SHIFT": 7},
-    "left": {"UP": 2, "LEFT": 3, "RIGHT": 4, "DOWN": 5, "FRONT": 6, "SHIFT": 7},
+    "right": {"Y": 2, "Z": 3, "A": 4, "B": 5, "SHIFT": 6, "FRONT": 7},
+    "left": {"UP": 2, "LEFT": 3, "RIGHT": 4, "DOWN": 5, "SHIFT": 6, "FRONT": 7},
 }
 KEYPAD_BUTTONS = {
     "right": {"A": 0x10, "B": 0x20, "Y": 0x40, "Z": 0x80, "SHIFT": 0x1000, "FRONT": 0x8000},
@@ -34,6 +36,7 @@ ANALOG = {"steer_left", "steer_right", "brake"}
 ACTIONS = DIGITAL.keys() | ANALOG | {"ignore"}
 DEFAULT_CONFIG = Path(__file__).with_name("zwift-play-bridge.toml")
 RIDE_ON = b"RideOn"
+FIRMWARE_REVISION = "00002a26-0000-1000-8000-00805f9b34fb"
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,11 @@ def map_input(data, config, side="right"):
     if inputs is None:
         return None
     pressed, horizontal, vertical = inputs
+    if config is None:
+        mask = sum(KEYPAD_BUTTONS[side][name] for name in pressed)
+        paddle = max(-100, min(100, horizontal))
+        return (mask, paddle, 0) if side == "left" else (mask, 0, paddle)
+
     bindings = config.left_buttons if side == "left" else config.buttons
     actions = [(action, 100) for name, action in bindings.items() if name in pressed]
     axis = horizontal if config.axis == "lr" else vertical
@@ -140,29 +148,56 @@ async def scan_controllers():
     return devices
 
 
-def select_controller(devices, selector):
+def select_controller(devices, selector, expected_side=None):
     target = selector.strip().casefold()
     matches = [(device, side, suffix) for device, name, suffix, side in devices
                if target in {name.casefold(), suffix.casefold(), f"zwift play-{side[0]} {suffix.casefold()}"}]
+    if expected_side is not None:
+        matching_side = [match for match in matches if match[1] == expected_side]
+        if not matching_side:
+            for _, side, suffix in matches:
+                if target in (suffix.casefold(), f"zwift play-{side[0]} {suffix.casefold()}"):
+                    raise ValueError(f"{selector!r} is a {side} controller, expected {expected_side}")
+        matches = matching_side
     if len(matches) > 1:
         suffixes = ", ".join(suffix for _, _, suffix in matches)
         raise ValueError(f"Multiple controllers match {selector!r}. Use one of these suffixes: {suffixes}")
     return matches[0][:2] if matches else None
 
 
-async def watch_play(selector, config, endpoint, monitor):
+class PlayInputs:
+    def __init__(self, endpoint):
+        self.endpoint = endpoint
+        self.states = {"left": dircon.IDLE, "right": dircon.IDLE}
+
+    def update(self, side, state):
+        self.states[side] = state
+        left, right = self.states["left"], self.states["right"]
+        self.endpoint.update((
+            left[0] | right[0],
+            max(left[1], right[1], key=abs),
+            max(right[2], left[2], key=abs),
+        ))
+
+
+async def send_ride_on(client, selector):
+    try:
+        value = await asyncio.wait_for(client.read_gatt_char(FIRMWARE_REVISION), timeout=3)
+        firmware = value.decode("ascii", errors="replace").strip("\0 \r\n\t")
+    except (BleakError, OSError, TimeoutError) as error:
+        logging.debug("Firmware revision unavailable for %s (%s)", selector, error)
+        firmware = ""
+    major = firmware.lstrip("vV").split(".", 1)[0]
+    versioned = major.isdecimal() and int(major) >= 2
+    message = RIDE_ON + b"\x02\x03" if versioned else RIDE_ON
+    logging.info("Play %s firmware %s, sending %s", selector, firmware or "unknown",
+                 "RideOn 02 03" if versioned else "RideOn")
+    await client.write_gatt_char(dircon.RX.hex(), message, response=False)
+
+
+async def watch_play(selector, expected_side, config, inputs, monitor, bluetooth_lock):
     while True:
-        logging.info("Looking for %s. Wake your controller with a button press.", selector)
-        try:
-            devices = await scan_controllers()
-        except (BleakError, OSError, TimeoutError) as error:
-            logging.warning("Bluetooth scan: %s", error)
-            await asyncio.sleep(1)
-            continue
-        selected = select_controller(devices, selector)
-        if selected is None:
-            continue
-        device, side = selected
+        side = None
         try:
             ready, disconnected = asyncio.Event(), asyncio.Event()
             last = None
@@ -180,32 +215,58 @@ async def watch_play(selector, config, endpoint, monitor):
                 if state is None:
                     return
                 ready.set()
-                endpoint.update(state)
+                inputs.update(side, state)
                 if monitor and data != last:
                     last = data
                     pressed, horizontal, vertical = decode_input(data, side)
-                    logging.info("buttons=%s LR=%d UD=%d → mask=0x%04x ZL=%d ZR=%d",
+                    logging.info("%s %s buttons=%s LR=%d UD=%d → mask=0x%04x ZL=%d ZR=%d", side, selector,
                                  ",".join(sorted(pressed)) or "-", horizontal, vertical, *state)
 
-            async with BleakClient(device, timeout=15, pair=False,
-                                   disconnected_callback=lambda _: disconnected.set()) as client:
-                for characteristic in (dircon.OUT, dircon.TX):
-                    await client.start_notify(characteristic.hex(), receive)
-                await client.write_gatt_char(dircon.RX.hex(), RIDE_ON, response=False)
-                await asyncio.wait_for(ready.wait(), 5)
-                logging.info("%s Play %s connected", side.capitalize(), selector)
+            async with AsyncExitStack() as connection:
+                # Serialize discovery and the initial GATT setup. Active links keep running.
+                async with bluetooth_lock:
+                    logging.info("Looking for %s. Wake your controller with a button press.", selector)
+                    selected = select_controller(await scan_controllers(), selector, expected_side)
+                    if selected is None:
+                        continue
+                    device, side = selected
+                    client = await connection.enter_async_context(BleakClient(
+                        device, timeout=15, pair=False,
+                        disconnected_callback=lambda _: disconnected.set(),
+                    ))
+                    for characteristic in (dircon.OUT, dircon.TX):
+                        await client.start_notify(characteristic.hex(), receive)
+                    await send_ride_on(client, selector)
+                    await asyncio.wait_for(ready.wait(), 5)
+                    logging.info("%s Play %s connected", side.capitalize(), selector)
                 await disconnected.wait()
-        except (BleakError, OSError, TimeoutError, ValueError) as error:
+        except (BleakError, OSError, TimeoutError) as error:
             logging.warning("Play %s: %s", selector, error)
         finally:
-            endpoint.update(dircon.IDLE)
+            if side is not None:
+                inputs.update(side, dircon.IDLE)
         await asyncio.sleep(1)
 
 
-async def run(selector, config, name, port, monitor):
+async def watch_inputs(targets, config, endpoint, monitor):
+    inputs = PlayInputs(endpoint)
+    bluetooth_lock = asyncio.Lock()
+    tasks = [
+        asyncio.create_task(watch_play(selector, side, config, inputs, monitor, bluetooth_lock))
+        for side, selector in targets.items()
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def run(targets, config, name, port, monitor):
     endpoint = dircon.Controller(name)
     if monitor:
-        await watch_play(selector, config, endpoint, True)
+        await watch_inputs(targets, config, endpoint, True)
         return
     async with await asyncio.start_server(endpoint.connect, "0.0.0.0", port):
         registration = await asyncio.create_subprocess_exec(
@@ -215,7 +276,7 @@ async def run(selector, config, name, port, monitor):
         logging.info("Select %s in Zwift Power Source, then Controls. Restore your trainer as Power Source.",
                      endpoint.name)
         tasks = [
-            asyncio.create_task(watch_play(selector, config, endpoint, False)),
+            asyncio.create_task(watch_inputs(targets, config, endpoint, False)),
             asyncio.create_task(endpoint.heartbeat()),
             asyncio.create_task(registration.wait()),
         ]
@@ -241,20 +302,29 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--device", metavar="NAME_OR_SUFFIX", help="Bluetooth name or four-digit hex suffix")
+    mode.add_argument("--both", action="store_true", help="Use one left and one right controller")
     mode.add_argument("--scan", action="store_true", help="List supported nearby Zwift Play controllers")
     mode.add_argument("--list-actions", action="store_true", help="Show action names for the TOML config")
+    parser.add_argument("--left", metavar="NAME_OR_SUFFIX", help="Left controller to use with --both")
+    parser.add_argument("--right", metavar="NAME_OR_SUFFIX", help="Right controller to use with --both")
+    parser.add_argument("--passthrough", action="store_true", help="Keep the stock Play bindings in --both mode")
     parser.add_argument("--name", default=dircon.DEFAULT_NAME, help="Virtual controller name shown in Zwift")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--port", type=int, default=36866, help="Direct Connect TCP port")
     parser.add_argument("--monitor", action="store_true", help="Show physical inputs without advertising to Zwift")
     args = parser.parse_args()
+    if args.both:
+        if not (args.left and args.left.strip() and args.right and args.right.strip()):
+            parser.error("--both requires --left and --right")
+    elif args.left is not None or args.right is not None or args.passthrough:
+        parser.error("--left, --right and --passthrough require --both")
+    if args.monitor and not (args.device or args.both):
+        parser.error("--monitor requires --device or --both")
     if args.list_actions:
         print("\n".join(sorted(ACTIONS)))
         return
     if sys.platform != "darwin":
         parser.error("This release requires macOS and Bonjour.")
-    if args.monitor and not args.device:
-        parser.error("--monitor requires --device")
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
     name = args.name.strip()
@@ -271,7 +341,9 @@ def main():
             if not devices:
                 parser.exit(1, "No compatible Zwift Play found. Wake it and scan again.\n")
         else:
-            asyncio.run(run(args.device, load_config(args.config), name, args.port, args.monitor))
+            targets = {"left": args.left, "right": args.right} if args.both else {None: args.device}
+            config = None if args.passthrough else load_config(args.config)
+            asyncio.run(run(targets, config, name, args.port, args.monitor))
     except (BleakError, OSError, RuntimeError, ValueError) as error:
         parser.exit(1, f"{error}\n")
     except KeyboardInterrupt:

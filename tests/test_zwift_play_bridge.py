@@ -4,6 +4,7 @@ from pathlib import Path
 import struct
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import AsyncMock
 
 import zwift_dircon as dircon
 import zwift_play_bridge as bridge
@@ -11,6 +12,28 @@ import zwift_play_bridge as bridge
 
 CONFIG = Path(__file__).resolve().parents[1] / "zwift-play-bridge.toml"
 NEUTRAL = bytes.fromhex("07 08 00 10 01 18 01 20 01 28 01 30 01 38 01 40 00 48 00")
+
+
+class RideOnTests(unittest.IsolatedAsyncioTestCase):
+    async def test_selects_rideon_from_firmware_revision(self):
+        for revision, message in (
+            (b"1.3.1", b"RideOn"),
+            (b"2.0.0", b"RideOn\x02\x03"),
+            (b"2.0.1\x00", b"RideOn\x02\x03"),
+            (b"3.1.0", b"RideOn\x02\x03"),
+        ):
+            with self.subTest(revision=revision):
+                client = AsyncMock(spec=bridge.BleakClient)
+                client.read_gatt_char.return_value = bytearray(revision)
+                await bridge.send_ride_on(client, "test")
+                client.read_gatt_char.assert_awaited_once_with("00002a26-0000-1000-8000-00805f9b34fb")
+                client.write_gatt_char.assert_awaited_once_with(dircon.RX.hex(), message, response=False)
+
+    async def test_uses_short_rideon_if_firmware_read_fails(self):
+        client = AsyncMock(spec=bridge.BleakClient)
+        client.read_gatt_char.side_effect = bridge.BleakError("Firmware Revision unavailable")
+        await bridge.send_ride_on(client, "test")
+        client.write_gatt_char.assert_awaited_once_with(dircon.RX.hex(), b"RideOn", response=False)
 
 
 class DeviceSelectionTests(unittest.TestCase):
@@ -26,6 +49,15 @@ class DeviceSelectionTests(unittest.TestCase):
         devices = [(object(), "Zwift Play", "102A", "right"), (object(), "Zwift Play", "B048", "left")]
         with self.assertRaisesRegex(ValueError, "102A.*B048"):
             bridge.select_controller(devices, "Zwift Play")
+
+    def test_both_mode_distinguishes_sides_with_the_same_name(self):
+        right, left = object(), object()
+        devices = [(right, "Zwift Play", "102A", "right"), (left, "Zwift Play", "B048", "left")]
+        self.assertEqual(bridge.select_controller(devices, "Zwift Play", "left"), (left, "left"))
+        self.assertEqual(bridge.select_controller(devices, "Zwift Play", "right"), (right, "right"))
+        self.assertIsNone(bridge.select_controller(devices[:1], "Zwift Play", "left"))
+        with self.assertRaisesRegex(ValueError, "right.*left"):
+            bridge.select_controller(devices, "102A", "left")
 
 
 class MappingTests(unittest.TestCase):
@@ -47,7 +79,7 @@ class MappingTests(unittest.TestCase):
             config = bridge.load_config(path)
 
         pressed = bytearray(NEUTRAL)
-        pressed[14] = 0
+        pressed[12] = 0
         frame = dircon.keypad(bridge.map_input(pressed, config))
         self.assertEqual(frame, bytes.fromhex("23 08 ff dd ff ff 0f 1a 04 08 00 10 00 1a 04 08 01 10 00"))
         self.assertEqual(bridge.map_input(NEUTRAL, config), (0, 0, 0))
@@ -82,6 +114,27 @@ class MappingTests(unittest.TestCase):
     def test_new_left_paddle_can_map_a_brake_motion_to_steering(self):
         packet = "23 08 ff ff ff ff 0f 1a 05 08 00 10 c8 01 1a 04 08 01 10 00"
         self.assertEqual(bridge.map_input(bytes.fromhex(packet), self.config, "left"), (0, 0, 100))
+
+    def test_passthrough_keeps_native_buttons_and_paddle_signs(self):
+        for side, frame, state in (
+            ("right", "07 10 00 18 00 20 00 28 00 30 00 40 c7 01", (0x10F0, 0, -100)),
+            ("right", "07 40 c8 01", (0, 0, 100)),
+            ("left", "23 08 fd ff ff ff 0f 1a 05 08 00 10 c8 01", (0x02, 100, 0)),
+            ("left", "23 08 ff fd ff ff 0f 1a 05 08 00 10 c7 01", (0x0100, -100, 0)),
+        ):
+            with self.subTest(side=side, frame=frame):
+                self.assertEqual(bridge.map_input(bytes.fromhex(frame), None, side), state)
+
+    def test_one_side_releasing_preserves_the_other_side(self):
+        endpoint = dircon.Controller()
+        inputs = bridge.PlayInputs(endpoint)
+        inputs.update("left", (0x0100, -75, 0))
+        inputs.update("right", (0x1000, 0, -65))
+        self.assertEqual(endpoint.state, (0x1100, -75, -65))
+        inputs.update("left", dircon.IDLE)
+        self.assertEqual(endpoint.state, (0x1000, 0, -65))
+        inputs.update("right", dircon.IDLE)
+        self.assertEqual(endpoint.state, dircon.IDLE)
 
 
 class DirectConnectTests(unittest.IsolatedAsyncioTestCase):
